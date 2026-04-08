@@ -7,6 +7,9 @@
 <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@600;700;800;900&family=Plus+Jakarta+Sans:ital,wght@0,300;0,400;0,500;0,600;1,300&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<!-- EmailJS — sends OTP and reset emails directly from browser, no SMTP needed -->
+<script src="https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js"></script>
+<script>emailjs.init("sKL1CODDVcySVxD04");</script>
 <style>
 :root{
   --bg:#ffffff;--bg2:#fafaf8;--bg3:#f5f3ef;--bg4:#ede9e2;--bg5:#e2ddd5;
@@ -472,7 +475,7 @@ textarea:focus{border-color:var(--gold)}
         <button class="btn btn-p btn-w" id="otp-btn" onclick="verifyOTP()">Verify &amp; create account</button>
         <div class="otp-resend">Didn't get it? <a onclick="resendOTP()">Resend code</a> · <a onclick="showReg()">Change email</a></div>
         <div style="margin-top:.75rem;background:rgba(201,146,26,.08);border:1px solid var(--gold3);border-radius:var(--r);padding:.75rem;font-size:12px;color:var(--text2)">
-          💡 <strong>Not receiving OTP?</strong> Check your spam/junk folder. If the issue persists, your server's SMTP settings may need to be configured. Contact support or try registering with a different email.
+          💡 <strong>Not receiving OTP?</strong> Check your spam/junk folder. The code was sent via EmailJS — it should arrive within 30 seconds. Click "Resend code" if needed.
         </div>
       </div>
 
@@ -768,75 +771,52 @@ async function doLogin() {
   setLoading(btn, false, 'Sign in');
 }
 
-function showBypassButton(errEl, reason) {
-  errEl.innerHTML = `
-    <div style="margin-bottom:8px;font-weight:600">${reason}</div>
-    <button onclick="directRegister()" style="background:linear-gradient(135deg,var(--orange),var(--orange2));color:#fff;border:none;padding:10px 18px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;font-family:var(--font-b);width:100%;margin-top:2px">
-      ✓ Sign up without email verification →
-    </button>
-    <div style="font-size:11px;color:var(--text3);margin-top:8px">Fix: add <code>RESEND_API_KEY</code> in Render env vars — free at <a href="https://resend.com" target="_blank" style="color:var(--gold)">resend.com</a></div>`;
-  errEl.style.display = 'block';
-}
+// ═══════════════════════════════════════════
+// EMAILJS CONFIG
+// ═══════════════════════════════════════════
+const EJS_SERVICE  = 'service_siz01v8';
+const EJS_TEMPLATE = 'template_1m7d4nn';
+const EJS_KEY      = 'sKL1CODDVcySVxD04';
 
 async function sendOTP() {
   const btn = document.getElementById('reg-btn'), err = document.getElementById('reg-err');
-  const name = document.getElementById('reg-name').value.trim();
+  const name  = document.getElementById('reg-name').value.trim();
   const email = document.getElementById('reg-email').value.trim();
-  const pw = document.getElementById('reg-pw').value;
+  const pw    = document.getElementById('reg-pw').value;
   const cuisines = Array.from(document.querySelectorAll('#reg-cuisines .chip.on')).map(c => c.textContent);
   const budget = +document.getElementById('reg-budget').value;
-  const spice = +document.getElementById('reg-spice').value;
+  const spice  = +document.getElementById('reg-spice').value;
   err.style.display = 'none';
   if (!name || !email || !pw) { showErr(err, 'Please fill all required fields'); return; }
   if (pw.length < 6) { showErr(err, 'Password must be at least 6 characters'); return; }
 
   S.regData = { name, email, password: pw, preferredCuisines: cuisines, budgetPreference: budget, spicePreference: spice };
-
-  // Show countdown so user knows it's working, not frozen
-  let secs = 12;
-  btn.disabled = true;
-  const countdownInterval = setInterval(() => {
-    secs--;
-    btn.innerHTML = `<span class="spinner"></span> Sending OTP… (${secs}s)`;
-    if (secs <= 0) clearInterval(countdownInterval);
-  }, 1000);
-  btn.innerHTML = `<span class="spinner"></span> Sending OTP… (${secs}s)`;
+  setLoading(btn, true, 'Sending OTP…');
 
   try {
-    const resp = await api('POST', '/auth/send-otp', S.regData);
-    clearInterval(countdownInterval);
+    // Step 1 — backend creates user + hashed OTP, returns plain OTP
+    const data = await api('POST', '/auth/prepare-otp', S.regData);
+
+    // Step 2 — EmailJS sends the OTP from the browser (no SMTP, no Render port issues)
+    await emailjs.send(EJS_SERVICE, EJS_TEMPLATE, {
+      to_name:  name,
+      to_email: email,
+      otp_code: data.otp,
+      app_name: 'Food Spot AI',
+    }, EJS_KEY);
+
+    // Step 3 — show OTP input
     document.querySelector('#otp-sub strong').textContent = email;
     showOTP();
-    toast('OTP sent to ' + email + '. Check spam folder too.', 'ok');
+    toast('Verification code sent to ' + email, 'ok');
   } catch (e) {
-    clearInterval(countdownInterval);
-    const msg = e.message || '';
-    const isConfigErr = msg.includes('not configured') || msg.includes('EMAIL_USER') || msg.includes('EMAIL_PASS') || msg.includes('not_configured');
-    const isAuthErr   = msg.includes('App Password') || msg.includes('authentication') || msg.includes('auth_failed') || msg.includes('535') || msg.includes('Invalid login');
-    const isTimeout   = msg.includes('timeout') || msg.includes('timed out');
-    const isConnect   = msg.includes('ECONNREFUSED') || msg.includes('connect') || msg.includes('connection');
-
-    if (isConfigErr) {
-      showBypassButton(err, 'Email service not configured on server.');
-    } else if (isAuthErr) {
-      showBypassButton(err, 'Gmail authentication failed — App Password needed.');
-    } else if (isTimeout || isConnect) {
-      showBypassButton(err, 'Email server unreachable. SMTP may not be set up.');
-    } else {
-      // Unknown error — still offer bypass
-      err.innerHTML = `<div style="margin-bottom:8px">${msg}</div>
-        <button onclick="directRegister()" style="background:linear-gradient(135deg,var(--orange),var(--orange2));color:#fff;border:none;padding:9px 18px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;font-family:var(--font-b);width:100%;margin-top:4px">
-          Sign up without email verification →
-        </button>`;
-      err.style.display = 'block';
-    }
+    const msg = (typeof e === 'object' && e.text) ? e.text : (e.message || 'Failed to send OTP');
+    showErr(err, msg + '<br><br><button onclick="directRegister()" style="background:linear-gradient(135deg,var(--orange),var(--orange2));color:#fff;border:none;padding:9px 18px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;font-family:var(--font-b);width:100%;margin-top:4px">Sign up without email verification →</button>');
   }
-
-  btn.disabled = false;
-  btn.innerHTML = 'Send verification code →';
+  setLoading(btn, false, 'Send verification code →');
 }
 
-// Direct register without OTP — fallback when SMTP is broken/unconfigured
+// Fallback — register without OTP
 async function directRegister() {
   const err = document.getElementById('reg-err');
   if (!S.regData) return;
@@ -849,8 +829,7 @@ async function directRegister() {
     toast('Account created! Welcome to Food Spot AI 🎉', 'ok');
   } catch (e) {
     showErr(err, e.message);
-    btn.disabled = false;
-    btn.innerHTML = 'Send verification code →';
+    setLoading(btn, false, 'Send verification code →');
   }
 }
 
@@ -869,21 +848,33 @@ async function verifyOTP() {
 }
 
 async function resendOTP() {
-  if (!S.regData) { toast('Please fill in registration details first', 'err'); showReg(); return; }
+  if (!S.regData) { toast('Please fill registration details first', 'err'); showReg(); return; }
   try {
-    await api('POST', '/auth/send-otp', S.regData);
-    toast('New OTP sent to ' + S.regData.email + '. Also check spam folder.', 'ok');
+    const data = await api('POST', '/auth/prepare-otp', S.regData);
+    await emailjs.send(EJS_SERVICE, EJS_TEMPLATE, {
+      to_name: S.regData.name, to_email: S.regData.email,
+      otp_code: data.otp, app_name: 'Food Spot AI',
+    }, EJS_KEY);
     ['o1','o2','o3','o4','o5','o6'].forEach(id => document.getElementById(id).value = '');
     document.getElementById('o1').focus();
-  } catch (e) { toast(e.message, 'err'); }
+    toast('New code sent to ' + S.regData.email, 'ok');
+  } catch (e) {
+    toast((typeof e === 'object' && e.text) ? e.text : (e.message || 'Failed to resend'), 'err');
+  }
 }
 async function resendOTPForEmail(email) {
   if (S.regData && S.regData.email === email) {
-    try { await api('POST', '/auth/send-otp', S.regData); toast('OTP sent to ' + email, 'ok'); }
-    catch (e) { toast(e.message, 'err'); }
+    try {
+      const data = await api('POST', '/auth/prepare-otp', S.regData);
+      await emailjs.send(EJS_SERVICE, EJS_TEMPLATE, {
+        to_name: S.regData.name, to_email: email,
+        otp_code: data.otp, app_name: 'Food Spot AI',
+      }, EJS_KEY);
+      toast('OTP sent to ' + email, 'ok');
+    } catch (e) { toast(e.message || 'Failed', 'err'); }
     return;
   }
-  toast('Please go to sign up and enter your details again before resending OTP', 'err');
+  toast('Please go to sign up and enter your details again', 'err');
   showReg(); document.getElementById('reg-email').value = email || '';
 }
 
@@ -894,13 +885,27 @@ async function doForgot() {
   if (!email) { showErr(err, 'Please enter your email'); return; }
   setLoading(btn, true, 'Sending…');
   try {
-    const data = await api('POST', '/auth/forgot-password', { email });
+    // Backend generates reset token and returns the link (and user name)
+    const data = await api('POST', '/auth/prepare-reset', { email });
+    if (data.exists && data.resetLink) {
+      // EmailJS sends the reset link from the browser
+      await emailjs.send(EJS_SERVICE, EJS_TEMPLATE, {
+        to_name:  data.name,
+        to_email: email,
+        otp_code: 'Click to reset your password: ' + data.resetLink,
+        app_name: 'Food Spot AI',
+      }, EJS_KEY);
+    }
+    // Always show success (don't reveal if email exists)
     err.style.display = 'block';
     err.style.background = 'rgba(45,122,79,.07)';
     err.style.borderColor = 'rgba(45,122,79,.2)';
     err.style.color = 'var(--green)';
-    err.textContent = data.message;
-  } catch (e) { showErr(err, e.message); }
+    err.textContent = 'If an account with that email exists, a reset link has been sent.';
+  } catch (e) {
+    const msg = (typeof e === 'object' && e.text) ? e.text : (e.message || 'Failed to send');
+    showErr(err, msg);
+  }
   setLoading(btn, false, 'Send reset link');
 }
 

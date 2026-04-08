@@ -1,24 +1,45 @@
-// middleware/auth.js — JWT protect middleware
-// This file must contain ONLY this protect function.
-// Do NOT put route handlers here.
+// backend/middleware/auth.js
+// JWT authentication middleware — just exports the `protect` function.
+// The actual auth routes (login, register, OTP) live in backend/routes/auth.js
 
 const jwt  = require('jsonwebtoken');
 const User = require('../models/User');
 
 const protect = async (req, res, next) => {
   try {
-    const header = req.headers.authorization;
-    if (!header || !header.startsWith('Bearer ')) {
-      return res.status(401).json({ success: false, message: 'Not authenticated. Please log in.' });
+    let token;
+
+    if (
+      req.headers.authorization &&
+      req.headers.authorization.startsWith('Bearer ')
+    ) {
+      token = req.headers.authorization.split(' ')[1];
     }
-    const token   = header.split(' ')[1];
+
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        message: 'Not authenticated. Please log in.',
+      });
+    }
+
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     const user    = await User.findById(decoded.id);
-    if (!user) return res.status(401).json({ success: false, message: 'User no longer exists.' });
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: 'User no longer exists.',
+      });
+    }
+
     req.user = user;
     next();
-  } catch {
-    return res.status(401).json({ success: false, message: 'Invalid or expired token. Please log in again.' });
+  } catch (err) {
+    return res.status(401).json({
+      success: false,
+      message: 'Invalid or expired token. Please log in again.',
+    });
   }
 };
 

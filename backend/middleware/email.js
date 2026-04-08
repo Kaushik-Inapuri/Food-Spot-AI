@@ -16,8 +16,7 @@ const RESEND_API_URL = 'https://api.resend.com/emails';
 // From address — Resend free tier requires using their onboarding domain
 // until you verify your own domain. Use this default or set EMAIL_FROM in .env.
 function getFromAddress() {
-  return process.env.EMAIL_FROM || 'Food Spot AI <onboarding@resend.dev>';
-}
+return process.env.EMAIL_FROM || 'Food Spot AI <onboarding@resend.dev>';}
 
 async function sendViaResend({ to, subject, html, text }) {
   const apiKey = process.env.RESEND_API_KEY;
