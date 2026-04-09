@@ -500,6 +500,16 @@ textarea:focus{border-color:var(--gold)}
     <div class="pg-sub" id="personal-sub">AI-powered recommendations tuned to your taste</div>
   </div></div>
   <div class="pc">
+    <!-- AI Chat Bar -->
+    <div style="background:linear-gradient(135deg,var(--cream2),var(--gold-light));border:1.5px solid var(--gold3);border-radius:var(--rl);padding:1rem 1.25rem;margin-bottom:1.25rem;display:flex;gap:10px;align-items:center;box-shadow:var(--shadow)">
+      <span style="font-size:20px">🤖</span>
+      <input id="ai-chat-input" class="f-input" style="flex:1;margin:0;background:var(--bg);font-size:13px" placeholder='Ask AI anything — e.g. "spicy food under ₹200" or "best for a date night"' onkeydown="if(event.key==='Enter')askAI()">
+      <button class="btn btn-p btn-s" onclick="askAI()" id="ai-chat-btn">Ask AI</button>
+    </div>
+    <div id="ai-chat-result" style="display:none;margin-bottom:1.25rem;background:var(--bg);border:1.5px solid var(--gold3);border-radius:var(--rl);padding:1rem 1.25rem;box-shadow:var(--shadow)">
+      <div style="font-size:11px;font-weight:700;color:var(--gold);text-transform:uppercase;letter-spacing:.08em;margin-bottom:.5rem">🤖 AI says</div>
+      <div id="ai-chat-text" style="font-size:13px;color:var(--text2);line-height:1.65"></div>
+    </div>
     <div class="results-head">
       <div class="left">
         <div class="search-wrap" style="margin-bottom:0">
@@ -918,6 +928,47 @@ async function doForgot() {
     showErr(err, msg);
   }
   setLoading(btn, false, 'Send reset link');
+}
+
+// ═══════════════════════════════════════════
+// GROQ AI CHAT
+// ═══════════════════════════════════════════
+async function askAI() {
+  if (!S.user) { toast('Please log in first', 'err'); return; }
+  const input = document.getElementById('ai-chat-input');
+  const btn   = document.getElementById('ai-chat-btn');
+  const result = document.getElementById('ai-chat-result');
+  const text   = document.getElementById('ai-chat-text');
+  const msg = input.value.trim();
+  if (!msg) return;
+
+  setLoading(btn, true, 'Thinking…');
+  result.style.display = 'none';
+
+  try {
+    // Try AI-powered recommendation first
+    const data = await api('POST', '/groq/recommend', { message: msg });
+    if (data.restaurants?.length) {
+      S.personalRests = data.restaurants;
+      filterPersonal();
+      text.innerHTML = `<strong>Found ${data.restaurants.length} restaurants for "${msg}"</strong><br>${data.restaurants[0]?.aiReason || ''}`;
+      result.style.display = 'block';
+      input.value = '';
+      toast('AI recommendations ready!', 'ok');
+    }
+  } catch (e) {
+    // Fallback to chat reply
+    try {
+      const data = await api('POST', '/groq/chat', { message: msg });
+      text.innerHTML = data.reply || 'No response from AI.';
+      result.style.display = 'block';
+    } catch (e2) {
+      toast('AI is not available right now. Using standard recommendations.', 'err');
+      fetchPersonal();
+    }
+  }
+
+  setLoading(btn, false, 'Ask AI');
 }
 
 function onAuth(data) {
