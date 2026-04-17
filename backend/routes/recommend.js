@@ -1,261 +1,257 @@
-/**
- * routes/recommend.js
- * Implements the complete FoodSpot AI workflow:
- *   - New User (cold start)
- *   - Returning → Regular Choice
- *   - Returning → Try New → Surprise Me
- *   - Returning → Try New → Select Preferences
- * 
- * IMPORTANT: aiScore is computed ONCE here and passed to frontend.
- * Frontend and detail page MUST reuse this score — never recalculate.
- */
+// routes/recommend.js — SPEC-COMPLETE v2
+// New spec implementations:
+//   1. Cold-start path: detected via isFirstTimeUser(), returns top-rated filtered by veg pref
+//   2. Regular Choice: returning users only see budget selector (cuisine+spice already known)
+//   3. Veg/Non-Veg filter applied in scoring
+//   4. Distance factored into score when userLocation provided
+//   5. Community score (avg feedback) still applied
+
 const express    = require('express');
 const Restaurant = require('../models/Restaurant');
 const Session    = require('../models/Session');
 const Feedback   = require('../models/Feedback');
 const { protect } = require('../middleware/auth');
 const {
-  calculateScore,
-  applyHardFilters,
-  buildFeedbackMap,
+  scoreRestaurant,
+  scoreForGroup,
+  aggregatePreferences,
+  aiRankRestaurants,
+  isFirstTimeUser,
 } = require('../middleware/recommendEngine');
 
 const router = express.Router();
 
-// ── Detect if user is first-time (no feedback, no selections) ────────────────
-async function isNewUser(userId, user) {
-  const hasFeedback    = (user.likedRestaurants || []).length > 0 ||
-                         (user.dislikedRestaurants || []).length > 0;
-  if (hasFeedback) return false;
-  const hasSelection   = await Session.findOne({ userId, selectedRestaurant: { $ne: null } });
-  return !hasSelection;
+// ── Attach community scores ────────────────────────────────
+async function attachCommunityScores(restaurants) {
+  const ids = restaurants.map(r => r._id);
+  const feedbacks = await Feedback.find({ restaurantId: { $in: ids } });
+  const totals = {}, counts = {};
+  feedbacks.forEach(fb => {
+    const id = String(fb.restaurantId);
+    totals[id] = (totals[id] || 0) + fb.rating;
+    counts[id] = (counts[id] || 0) + 1;
+  });
+  return restaurants.map(r => {
+    const id = String(r._id || r.id);
+    const communityScore = counts[id] ? +(totals[id] / counts[id]).toFixed(1) : null;
+    return { ...r.toObject ? r.toObject() : r, communityScore, feedbackCount: counts[id] || 0 };
+  });
 }
 
-// ── Load feedback map for a user ─────────────────────────────────────────────
-async function getUserFeedbackMap(userId) {
-  try {
-    return buildFeedbackMap(await Feedback.find({ userId }).lean());
-  } catch (_) { return {}; }
-}
-
-// ── Load visited restaurant IDs ──────────────────────────────────────────────
-async function getVisitedIds(userId) {
-  try {
-    const ids = await Session.find({ userId, selectedRestaurant: { $ne: null } }).distinct('selectedRestaurant');
-    return ids.map(String);
-  } catch (_) { return []; }
-}
-
-// ── Attach aiScore to each restaurant ────────────────────────────────────────
-// This is the ONLY place aiScore is set on a restaurant object.
-function attachScores(restaurants, mode, { pref, filters, members, userLocation } = {}) {
-  return restaurants.map(r => ({
-    ...r.toObject ? r.toObject() : r,
-    aiScore: calculateScore(r, { mode, pref, filters, members, userLocation }),
-  }));
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════
 // POST /api/recommend/personal
-// Body: { submode, cuisines, budget, spice, vegPreference, userLat, userLng }
-//
-// submode values:
-//   'regular'            → Returning, Regular Choice
-//   'surprise'           → Returning, Try New → Surprise Me
-//   'select-preferences' → Returning, Try New → Select Preferences
-//   (omitted / 'auto')  → system auto-detects new vs returning
-// ─────────────────────────────────────────────────────────────────────────────
+// Body: {
+//   cuisines[], budget, spice, vegPreference, submode,
+//   userLat, userLng        ← NEW: for distance scoring
+// }
+// Returns extra flag: { isColdStart } so frontend knows which UI to show
+// ═══════════════════════════════════════════════════════════
 router.post('/personal', protect, async (req, res) => {
   try {
-    const {
-      submode,
-      cuisines,
-      budget,
-      spice,
-      vegPreference,
-      userLat,
-      userLng,
-    } = req.body;
+    const { cuisines, budget, spice, vegPreference, submode = 'regular', userLat, userLng } = req.body;
+    const user = req.user;
 
-    const user         = req.user;
-    const userLocation = (userLat && userLng)
-      ? { lat: parseFloat(userLat), lng: parseFloat(userLng) }
-      : null;
+    const userLocation = (userLat && userLng) ? { lat: parseFloat(userLat), lng: parseFloat(userLng) } : null;
 
-    const feedbackMap = await getUserFeedbackMap(user._id);
-    const visitedIds  = await getVisitedIds(user._id);
-    const newUser     = await isNewUser(user._id, user);
+    // ── Cold-start detection ──────────────────────────────
+    const coldStart = isFirstTimeUser(user);
 
-    // ── Build user preference profile ────────────────────────────────────────
     const pref = {
-      preferredCuisines:   user.preferredCuisines    || [],
-      budgetPreference:    user.budgetPreference      || 2,
-      spicePreference:     user.spicePreference       || 3,
-      vegPreference:       user.vegPreference         || 'any',
-      likedRestaurants:    user.likedRestaurants      || [],
-      dislikedRestaurants: user.dislikedRestaurants   || [],
-      feedbackMap,
-      visitedIds,
+      preferredCuisines: cuisines?.length ? cuisines : user.preferredCuisines,
+      budgetPreference:  budget         || user.budgetPreference,
+      spicePreference:   spice          || user.spicePreference,
+      // Spec: veg preference is first-class — use request param or user's saved pref
+      vegPreference:     vegPreference  || user.vegPreference || 'any',
     };
 
     let restaurants = await Restaurant.find();
-    let scored, mode, sessionMode;
+    const dislikedIds = (user.dislikedRestaurants || []).map(String);
 
-    // ════════════════════════════════════════════════════════════════════════
-    // PATH A — NEW USER (cold start)
-    // ════════════════════════════════════════════════════════════════════════
-    if (newUser || submode === 'new-user') {
-      // Step 1: Collect filters from request
-      const coldFilters = {
-        cuisines:      cuisines    || [],
-        budget:        budget      || null,
-        vegPreference: vegPreference || 'any',
+    if (submode === 'new') {
+      const visitedIds = (await Session.find({ userId: user._id, selectedRestaurant: { $ne: null } })
+        .distinct('selectedRestaurant')).map(String);
+      restaurants = restaurants.filter(r => !visitedIds.includes(String(r._id)));
+    }
+
+    if (submode === 'surprise') {
+      const pool   = restaurants.filter(r => r.rating >= 4.0 && !dislikedIds.includes(String(r._id)));
+      const source = pool.length ? pool : restaurants;
+      const picked = source[Math.floor(Math.random() * source.length)];
+      if (!picked) return res.json({ success: true, restaurants: [], session: null, isColdStart: coldStart });
+      const [withScore] = await attachCommunityScores([picked]);
+      const session = await Session.create({
+        userId: user._id, mode: 'surprise',
+        filters: { cuisines: pref.preferredCuisines, budget: pref.budgetPreference, spice: pref.spicePreference, submode },
+        recommendedRestaurants: [picked._id],
+      });
+      return res.json({
+        success: true,
+        restaurants: [{ ...withScore, matchScore: scoreRestaurant(picked, pref, userLocation) }],
+        session, isColdStart: coldStart, aiUsed: false,
+      });
+    }
+
+    // ── Attach community scores ───────────────────────────
+    const withCommunity = await attachCommunityScores(restaurants);
+
+    // ── Score all restaurants ─────────────────────────────
+    let scored = withCommunity
+      .filter(r => !dislikedIds.includes(String(r._id)))
+      .map(r => ({ ...r, matchScore: scoreRestaurant(r, pref, userLocation) }));
+
+    // ── Cold-start: skip AI, just sort by community rating ─
+    if (coldStart) {
+      scored.sort((a, b) => {
+        // Veg hard filter first
+        if (pref.vegPreference === 'veg') {
+          const aTags = (a.tags || []).map(t => t.toLowerCase());
+          const bTags = (b.tags || []).map(t => t.toLowerCase());
+          const aVeg  = aTags.includes('veg');
+          const bVeg  = bTags.includes('veg');
+          if (aVeg && !bVeg) return -1;
+          if (!aVeg && bVeg) return 1;
+        }
+        // Then community score, then raw rating
+        return (b.communityScore || b.rating) - (a.communityScore || a.rating);
+      });
+    } else {
+      // ── Returning user: filter-first then community score ─
+      scored.sort((a, b) => {
+        if (b.matchScore !== a.matchScore) return b.matchScore - a.matchScore;
+        return (b.communityScore || b.rating) - (a.communityScore || a.rating);
+      });
+
+      // ── AI re-ranking for returning users ─────────────────
+      const userFeedbacks = await Feedback.find({ userId: user._id })
+        .populate('restaurantId', 'name cuisines priceLevel spiceLevel')
+        .sort({ createdAt: -1 }).limit(20);
+
+      const userContext = {
+        preferredCuisines:    pref.preferredCuisines,
+        budgetPreference:     pref.budgetPreference,
+        spicePreference:      pref.spicePreference,
+        vegPreference:        pref.vegPreference,
+        userLocation,
+        likedRestaurantIds:   (user.likedRestaurants || []).map(String),
+        dislikedRestaurantIds: dislikedIds,
+        recentFeedback: userFeedbacks.map(fb => ({
+          restaurant: fb.restaurantId?.name,
+          cuisines:   fb.restaurantId?.cuisines,
+          rating:     fb.rating,
+          liked:      fb.liked,
+        })).filter(f => f.restaurant),
       };
 
-      // Step 2: Apply hard filters
-      const filtered = applyHardFilters(restaurants, coldFilters);
-
-      // Step 3 & 4: Score and sort
-      scored = attachScores(filtered, 'new-user', { userLocation })
-        .sort((a, b) => b.aiScore - a.aiScore);
-
-      mode        = 'new-user';
-      sessionMode = 'first-time';
+      const aiRanked = await aiRankRestaurants(scored, userContext, false);
+      if (aiRanked) scored = aiRanked;
     }
 
-    // ════════════════════════════════════════════════════════════════════════
-    // PATH B — RETURNING → SURPRISE ME
-    // ════════════════════════════════════════════════════════════════════════
-    else if (submode === 'surprise') {
-      // Ignore most past preferences — score by diversity + trend + rating
-      // Exclude already-visited restaurants
-      const pool = restaurants.filter(r => !visitedIds.includes(String(r._id)));
-
-      scored = attachScores(pool.length ? pool : restaurants, 'surprise', { pref })
-        .sort((a, b) => b.aiScore - a.aiScore);
-
-      // Return only top 1 for the surprise card
-      scored     = [scored[0]].filter(Boolean);
-      mode       = 'surprise';
-      sessionMode = 'surprise';
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    // PATH C — RETURNING → SELECT PREFERENCES
-    // ════════════════════════════════════════════════════════════════════════
-    else if (submode === 'select-preferences') {
-      const filters = {
-        cuisines:      cuisines      || [],
-        budget:        budget        || pref.budgetPreference,
-        spice:         spice         || pref.spicePreference,
-        vegPreference: vegPreference || pref.vegPreference,
-      };
-
-      // Step 2: Hard filter
-      const filtered = applyHardFilters(restaurants, filters);
-
-      // Step 3 & 4: Score = filterMatch*0.5 + history*0.2 + rating*0.3
-      scored = attachScores(filtered, 'select-preferences', { filters, pref, userLocation })
-        .sort((a, b) => b.aiScore - a.aiScore);
-
-      mode        = 'select-preferences';
-      sessionMode = 'personalized';
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    // PATH D — RETURNING → REGULAR CHOICE (default)
-    // ════════════════════════════════════════════════════════════════════════
-    else {
-      // Regular Choice: ask only budget — rest from stored profile
-      const effectivePref = {
-        ...pref,
-        budgetPreference: budget || pref.budgetPreference,
-      };
-
-      // No hard cuisine filter for regular — just scoring
-      // Score = prefMatch*0.4 + behavior*0.3 + rating*0.2 + distance*0.1
-      scored = attachScores(restaurants, 'regular', { pref: effectivePref, userLocation })
-        .sort((a, b) => {
-          // Liked restaurants always surface first
-          const aLiked = (pref.likedRestaurants || []).map(r => String(r._id||r)).includes(String(a._id)) ? 1 : 0;
-          const bLiked = (pref.likedRestaurants || []).map(r => String(r._id||r)).includes(String(b._id)) ? 1 : 0;
-          if (bLiked !== aLiked) return bLiked - aLiked;
-          return b.aiScore - a.aiScore;
-        });
-
-      mode        = 'regular';
-      sessionMode = 'personalized';
-    }
-
-    // ── Save session ─────────────────────────────────────────────────────────
     const session = await Session.create({
-      userId: user._id,
-      mode:   sessionMode,
-      filters: {
-        cuisines: cuisines || pref.preferredCuisines,
-        budget:   budget   || pref.budgetPreference,
-        spice:    spice    || pref.spicePreference,
-        submode:  mode,
-      },
-      recommendedRestaurants: scored.map(r => r._id).filter(Boolean),
+      userId: user._id, mode: coldStart ? 'first-time' : 'personalized',
+      filters: { cuisines: pref.preferredCuisines, budget: pref.budgetPreference, spice: pref.spicePreference, submode },
+      recommendedRestaurants: scored.map(r => r._id),
     });
 
-    res.json({
-      success: true,
-      restaurants: scored,
-      session,
-      isNewUser: newUser,
-      scoringMode: mode,
-    });
+    res.json({ success: true, restaurants: scored, session, isColdStart: coldStart, aiUsed: !coldStart });
   } catch (err) {
-    console.error('recommend/personal error:', err.message);
     res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// ── POST /api/recommend/select ────────────────────────────────────────────────
+// ── POST /api/recommend/select ────────────────────────────
 router.post('/select', protect, async (req, res) => {
   try {
     const { sessionId, restaurantId } = req.body;
     if (!sessionId || !restaurantId)
       return res.status(400).json({ success: false, message: 'sessionId and restaurantId required.' });
-
     const session = await Session.findOneAndUpdate(
       { _id: sessionId, userId: req.user._id },
       { selectedRestaurant: restaurantId },
       { new: true }
     );
     if (!session) return res.status(404).json({ success: false, message: 'Session not found.' });
-
     res.json({ success: true, session });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// ── GET /api/recommend/history ────────────────────────────────────────────────
+// ── GET /api/recommend/history ────────────────────────────
 router.get('/history', protect, async (req, res) => {
   try {
     const sessions = await Session.find({ userId: req.user._id })
-      .populate('selectedRestaurant', 'name address emoji cuisines rating')
-      .sort({ createdAt: -1 })
-      .limit(20);
+      .populate('selectedRestaurant', 'name address emoji cuisines rating priceLevel')
+      .sort({ createdAt: -1 }).limit(30);
     res.json({ success: true, sessions });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// ── GET /api/recommend/pending-feedback ──────────────────────────────────────
+// ── GET /api/recommend/pending-feedback ───────────────────
 router.get('/pending-feedback', protect, async (req, res) => {
   try {
     const sessions = await Session.find({
-      userId: req.user._id,
-      selectedRestaurant: { $ne: null },
-      feedbackGiven: false,
+      userId: req.user._id, selectedRestaurant: { $ne: null }, feedbackGiven: false,
     }).populate('selectedRestaurant', 'name address emoji cuisines rating priceLevel spiceLevel menu');
-
     res.json({ success: true, sessions });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── POST /api/recommend/group ─────────────────────────────
+router.post('/group', protect, async (req, res) => {
+  try {
+    const { code } = req.body;
+    const GroupRoom = require('../models/GroupRoom');
+    const room = await GroupRoom.findOne({ code: code.toUpperCase(), active: true });
+    if (!room) return res.status(404).json({ success: false, message: 'Room not found or expired.' });
+
+    const members = room.members.map(m => ({
+      preferredCuisines: m.preferredCuisines,
+      budgetPreference:  m.budgetPreference,
+      spicePreference:   m.spicePreference,
+      vegPreference:     m.vegPreference || 'any',
+    }));
+
+    const restaurants    = await Restaurant.find();
+    const withCommunity  = await attachCommunityScores(restaurants);
+    const aggPref        = aggregatePreferences(members);
+
+    let scored = withCommunity.map(r => {
+      const { avg, scores } = scoreForGroup(r, members);
+      return { ...r, matchScore: avg, memberScores: scores };
+    }).sort((a, b) => {
+      if (b.matchScore !== a.matchScore) return b.matchScore - a.matchScore;
+      return (b.communityScore || b.rating) - (a.communityScore || a.rating);
+    });
+
+    const groupContext = {
+      members: room.members.map(m => ({
+        name:              m.name,
+        preferredCuisines: m.preferredCuisines,
+        budgetPreference:  m.budgetPreference,
+        spicePreference:   m.spicePreference,
+        vegPreference:     m.vegPreference || 'any',
+      })),
+      aggregated: aggPref,
+    };
+
+    let aiUsed = false;
+    const aiRanked = await aiRankRestaurants(scored, groupContext, true);
+    if (aiRanked) { scored = aiRanked; aiUsed = true; }
+
+    await Promise.all(room.members.map(m =>
+      Session.create({
+        userId: m.userId, mode: 'group',
+        groupRoomCode: room.code, groupMembers: room.members.map(x => x.userId),
+        filters: { cuisines: aggPref.preferredCuisines, budget: aggPref.budgetPreference, spice: aggPref.spicePreference },
+        recommendedRestaurants: scored.map(r => r._id),
+      })
+    ));
+
+    res.json({ success: true, restaurants: scored, room, aiUsed });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
